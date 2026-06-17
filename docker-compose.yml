@@ -1,0 +1,58 @@
+name: redis-in-action
+
+services:
+  postgres:
+    image: postgres:17.5-alpine3.21
+    container_name: postgres_db
+    restart: always
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
+      POSTGRES_DB: ${POSTGRES_DB}
+    volumes:
+      - ./postgres/init.sql:/docker-entrypoint-initdb.d/init.sql
+      - ./postgres/data:/data
+    ports:
+      - "5432:5432"
+  
+  redis: 
+    image: redis:7.4.3-alpine
+    container_name: redis_db
+    restart: always
+    ports:
+      - "6379:6379"
+
+  redisinsight:
+    image: redis/redisinsight:2.68
+    container_name: redis_insight
+    depends_on:
+      - redis
+    ports:
+      - "5540:5540"
+    restart: always
+
+  express-api:
+    image: node:24-alpine3.20
+    container_name: express_api
+    working_dir: /app
+    restart: always
+    ports:
+      - "3000:3000"
+      - "5555:5555"
+    env_file:
+      - .env
+    volumes:
+      - ./app:/app
+    command: sh -c "
+      npm install &&
+      npx prisma generate &&
+      echo 'Prisma client generated' &&
+      npm run dev
+      "
+
+
+
+
+
+
+
