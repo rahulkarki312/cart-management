@@ -1,159 +1,184 @@
-// src/lib/cartRedis.ts
 import redisClient from "./redis";
 import { CartItem } from "../types/cart";
 import { prisma } from "../lib/prisma";
 import { inventory_product } from "../../generated/prisma";
+
 // Key prefix for cart data in Redis
 const CART_KEY_PREFIX = "cart:";
 
-const CART_TTL_SECONDS = 60 * 60 * 24 * 7; // 7 days
-// const CART_TTL_SECONDS = 30; // Short TTL for testing purposes (30 seconds)
+const CART_TTL_SECONDS = 7 * 24 * 60 * 60; // 7 days
 
 /**
-  Generates the base Redis key for a user's cart.
-  @param identifier The unique identifier for the cart (session ID or authenticated user ID).
-  @returns The base Redis key for the cart.
+ * Generates the base Redis key for a user's cart.
+ * @param identifier The unique identifier for the cart (session ID or authenticated user ID).
+ * @returns The base Redis key.
  */
 function _getCartBaseKey(identifier: string): string {
   return `${CART_KEY_PREFIX}${identifier}`;
 }
 
 /**
- * Generates the Redis key for the quantity of a product in the user's cart.
- * @param identifier The unique identifier for the cart (session ID or authenticated user ID).
- * @returns The Redis key for the cart quantity.
+ * Generates the Redis key for a user's cart quantities.
+ * Stores { productId: quantity }
+ * @param identifier The unique identifier for the cart.
+ * @returns The Redis key.
  */
 function _getCartQtyKey(identifier: string): string {
   return `${_getCartBaseKey(identifier)}:qty`;
 }
 
-/** 
-  Generates the Redis key for the details of a product in the user's cart.
-  @param identifier The unique identifier for the cart (session ID or authenticated user ID).
-  @returns The Redis key for the cart details.
-
+/**
+ * Generates the Redis key for a user's cart item details.
+ * Stores { productId: JSON.stringify({ name, price, ...other_details }) }
+ * @param identifier The unique identifier for the cart.
+ * @returns The Redis key.
  */
 function _getCartDetailsKey(identifier: string): string {
   return `${_getCartBaseKey(identifier)}:details`;
 }
 
+/**
+ * Generates the Redis key for a user's cart promo code.
+ * @param identifier The unique identifier for the cart.
+ * @returns The Redis key.
+ */
 function _getCartPromoKey(identifier: string): string {
   return `${_getCartBaseKey(identifier)}:promo`;
 }
 
-async function setCartTTL(identifier: string): Promise<void> {
+/**
+ * Sets or resets the TTL for a user's cart and its associated promo code in Redis.
+ * This extends the cart's lifespan from the last interaction.
+ * @param identifier The unique identifier for the cart.
+ * @param pipeline An optional Redis pipeline to add commands to.
+ */
+async function _refreshCartTTL(identifier: string, pipeline?: ReturnType<typeof redisClient.multi>): Promise<void> {
   const qtyKey = _getCartQtyKey(identifier);
   const detailsKey = _getCartDetailsKey(identifier);
   const promoKey = _getCartPromoKey(identifier);
-  try {
-    await redisClient.expire(qtyKey, CART_TTL_SECONDS);
-    await redisClient.expire(detailsKey, CART_TTL_SECONDS);
-    await redisClient.expire(promoKey, CART_TTL_SECONDS);
-  } catch (error) {
-    console.error(
-      `Error setting TTL for cart for identifier ${identifier}:`,
-      error,
-    );
-    throw error;
+
+  const client = pipeline || redisClient; // Use pipeline if provided, otherwise direct client
+
+  // If not using a pipeline, execute directly with Promise.all for concurrency
+  if (!pipeline) {
+    await Promise.all([
+      client.expire(qtyKey, CART_TTL_SECONDS),
+      client.expire(detailsKey, CART_TTL_SECONDS),
+      client.expire(promoKey, CART_TTL_SECONDS),
+    ]);
+  } else {
+    // Add expire commands to the pipeline
+    pipeline.expire(qtyKey, CART_TTL_SECONDS);
+    pipeline.expire(detailsKey, CART_TTL_SECONDS);
+    pipeline.expire(promoKey, CART_TTL_SECONDS);
   }
 }
 
 /**
- * Generates the Redis key for a user's cart.
- * @param identifier The unique identifier for the cart (session ID or authenticated user ID).
- * @returns The Redis key.
- */
-function getUserCartKey(identifier: string): string {
-  return `${CART_KEY_PREFIX}${identifier}`;
-}
-
-/**
  * Adds a product to the user's cart in Redis.
- * Uses a Redis Hash to store cart items.
+ * Stores quantity and product details in separate hashes.
  * @param identifier The unique identifier for the cart (session ID or authenticated user ID).
  * @param item The CartItem to add.
  * @returns A promise that resolves when the operation is complete.
  */
 export async function addProductToCart(
   identifier: string,
-  item: CartItem,
+  item: CartItem
 ): Promise<void> {
-  // const cartKey = getUserCartKey(identifier);
-  // const itemKey = item.productId;
-
   const qtyKey = _getCartQtyKey(identifier);
   const detailsKey = _getCartDetailsKey(identifier);
   const productId = item.productId;
 
+  // Extract only necessary details for the 'details' hash to keep it lean
   const productDetails = {
     productId: item.productId,
     name: item.name,
     price: item.price,
+    // Include other non-quantity specific details here if any
   };
 
+  const pipeline = redisClient.multi(); // Start a transaction pipeline (atomic)
+
+  // Increment quantity in the quantity hash
+  pipeline.hincrby(qtyKey, productId, item.quantity);
+
+  // Set product details (always update to ensure they're fresh)
+  pipeline.hset(detailsKey, productId, JSON.stringify(productDetails));
+
+  await _refreshCartTTL(identifier, pipeline); // Add TTL commands to the pipeline
+
   try {
-    // Increment the quantity in the qty hash
-    await redisClient.hincrby(qtyKey, productId, item.quantity);
-
-    // Set the product details in the details hash (overwrites existing details if product already exists)
-    await redisClient.hset(
-      detailsKey,
-      productId,
-      JSON.stringify(productDetails),
-    );
-
-    await setCartTTL(identifier); // Reset TTL whenever the cart is modified
+    await pipeline.exec(); // Execute all commands in the pipeline
   } catch (error) {
     console.error(
       `Error adding product to cart for identifier ${identifier}:`,
-      error,
+      error
     );
     throw error;
   }
 }
 
 /**
- * Retrieves the entire cart for a user from Redis.
+ * Retrieves the entire cart for a user from Redis by combining data from qty and details hashes.
  * @param identifier The unique identifier for the cart (session ID or authenticated user ID).
  * @returns An array of CartItem objects.
  */
 export async function getCart(identifier: string): Promise<CartItem[]> {
   const qtyKey = _getCartQtyKey(identifier);
   const detailsKey = _getCartDetailsKey(identifier);
-  // const cartKey = getUserCartKey(identifier);
+
   try {
-    const [qtys, details] = await Promise.all([
-      redisClient.hgetall(qtyKey),
-      redisClient.hgetall(detailsKey),
-    ]);
+    // Use a pipeline to fetch quantities and details concurrently
+    const results = await redisClient.multi()
+      .hgetall(qtyKey)
+      .hgetall(detailsKey)
+      .exec();
 
-    const cartItems: CartItem[] = [];
-    // const cartData = await redisClient.hgetall(cartKey);
-
-    if (Object.keys(qtys).length > 0) {
-      await setCartTTL(identifier); // Reset TTL whenever the cart is accessed
+    if (!results) {
+        // This usually means the transaction was aborted (e.g., if WATCH was used and a key changed)
+        // For simple multi/exec without WATCH, this path is less likely to be hit on success.
+        console.warn(`Redis transaction for cart ${identifier} aborted or returned null results.`);
+        return [];
     }
 
+    // Explicitly cast each result tuple and extract the actual data
+    const [qtyResult, detailsResult] = results;
+
+    if (qtyResult[0] || detailsResult[0]) {
+        // Handle individual command errors within the transaction
+        console.error("Error in Redis multi/exec for cart:", qtyResult[0] || detailsResult[0]);
+        throw qtyResult[0] || detailsResult[0]; // Re-throw the first error found
+    }
+
+    const qtys = qtyResult[1] as Record<string, string>;
+    const details = detailsResult[1] as Record<string, string>;
+
+    const cartItems: CartItem[] = [];
+
+    // Reset TTL only if cart is not empty after fetching
+    if (Object.keys(qtys).length > 0) {
+      await _refreshCartTTL(identifier); // No pipeline here, as it's a read operation
+    }
+
+    // Combine quantities and details
     for (const productId in qtys) {
       if (qtys.hasOwnProperty(productId)) {
         const quantity = parseInt(qtys[productId], 10);
         const detailJson = details[productId];
 
         if (detailJson) {
-          const productDetails = JSON.parse(detailJson);
+          const productData = JSON.parse(detailJson);
           cartItems.push({
-            productId: productDetails.productId,
-            name: productDetails.name,
-            price: productDetails.price,
+            productId: productId,
+            name: productData.name,
+            price: productData.price,
             quantity: quantity,
-          } as CartItem);
+            // Include other details if present in productData
+          } as CartItem); // Cast to CartItem
         }
       }
     }
-
     return cartItems;
-
-    // return Object.values(cartData).map(item => JSON.parse(item) as CartItem);
   } catch (error) {
     console.error(`Error fetching cart for identifier ${identifier}:`, error);
     throw error;
@@ -162,30 +187,36 @@ export async function getCart(identifier: string): Promise<CartItem[]> {
 
 /**
  * Removes a product from the user's cart.
+ * Removes from both quantity and details hashes.
  * @param identifier The unique identifier for the cart (session ID or authenticated user ID).
  * @param productId The ID of the product to remove.
  */
 export async function removeProductFromCart(
   identifier: string,
-  productId: string,
+  productId: string
 ): Promise<void> {
   const qtyKey = _getCartQtyKey(identifier);
   const detailsKey = _getCartDetailsKey(identifier);
   const promoKey = _getCartPromoKey(identifier);
-  try {
-    await redisClient.hdel(qtyKey, productId);
-    await redisClient.hdel(detailsKey, productId);
 
-    // Check if the cart is now empty after deletion, and if so, remove the promo code as well
-    if ((await redisClient.hlen(qtyKey)) === 0) {
-      await redisClient.del(promoKey); // Remove promo code if cart is now empty
-    } else {
-      await setCartTTL(identifier); // Reset TTL if cart still has items after deletion
+  const pipeline = redisClient.multi();
+
+  pipeline.hdel(qtyKey, productId);
+  pipeline.hdel(detailsKey, productId);
+
+  await _refreshCartTTL(identifier, pipeline); // Add TTL commands to the pipeline
+
+  try {
+    await pipeline.exec();
+    // After deletion, check if the cart (qtyKey) is now empty
+    if (await redisClient.hlen(qtyKey) === 0) {
+      await redisClient.del(promoKey); // Delete promo code if cart is empty
+      console.log(`Cart ${identifier} is now empty. Promo code ${promoKey} deleted.`);
     }
   } catch (error) {
     console.error(
       `Error removing product ${productId} from cart for identifier ${identifier}:`,
-      error,
+      error
     );
     throw error;
   }
@@ -193,6 +224,7 @@ export async function removeProductFromCart(
 
 /**
  * Clears the entire cart for a user.
+ * Deletes all related keys (qty, details, promo).
  * @param identifier The unique identifier for the cart (session ID or authenticated user ID).
  */
 export async function clearCart(identifier: string): Promise<void> {
@@ -211,7 +243,7 @@ export async function clearCart(identifier: string): Promise<void> {
 
 /**
  * Updates the quantity of a product in the user's cart.
- * If quantity is 0 or less, the item is removed.
+ * If quantity is 0 or less, the item is removed from both hashes.
  * @param identifier The unique identifier for the cart (session ID or authenticated user ID).
  * @param productId The ID of the product to update.
  * @param quantity The new quantity.
@@ -219,38 +251,40 @@ export async function clearCart(identifier: string): Promise<void> {
 export async function updateCartItemQuantity(
   identifier: string,
   productId: string,
-  quantity: number,
+  quantity: number
 ): Promise<void> {
   const qtyKey = _getCartQtyKey(identifier);
   const detailsKey = _getCartDetailsKey(identifier);
   const promoKey = _getCartPromoKey(identifier);
-  try {
-    if (quantity <= 0) {
-      await redisClient.hdel(qtyKey, productId);
-      await redisClient.hdel(detailsKey, productId);
-      console.log(
-        `Product ${productId} removed from cart for identifier ${identifier} due to quantity <= 0`,
-      );
-      // Check if the cart is now empty after deletion, and if so, remove the promo code as well
-      if ((await redisClient.hlen(qtyKey)) === 0) {
-        await redisClient.del(promoKey); // Remove promo code if cart is now empty
-        console.log(`Cart ${identifier} is now empty. Promo code removed.`);
-      } else {
-        await setCartTTL(identifier); // Reset TTL if cart still has items after deletion
-      }
 
-      return;
+  const pipeline = redisClient.multi();
+
+  if (quantity <= 0) {
+    pipeline.hdel(qtyKey, productId);
+    pipeline.hdel(detailsKey, productId);
+    await _refreshCartTTL(identifier, pipeline); // Refresh TTL for remaining cart items if any
+    await pipeline.exec(); // Execute deletion
+    // After deletion, check if the cart (qtyKey) is now empty
+    if (await redisClient.hlen(qtyKey) === 0) {
+      await redisClient.del(promoKey); // Delete promo code if cart is empty
+      console.log(`Cart ${identifier} is now empty. Promo code ${promoKey} deleted.`);
     }
+    console.log(`Product ${productId} removed from cart for identifier ${identifier} due to quantity <= 0`);
+    return;
+  }
 
-    await redisClient.hset(qtyKey, productId, quantity.toString());
-    await setCartTTL(identifier); // Reset TTL whenever the cart is modified
-    console.log(
-      `Quantity for product ${productId} updated to ${quantity} in cart for identifier ${identifier}`,
-    );
+  // Update quantity in the quantity hash
+  pipeline.hset(qtyKey, productId, quantity.toString()); // HSET stores string
+
+  await _refreshCartTTL(identifier, pipeline); // Refresh TTL for cart
+
+  try {
+    await pipeline.exec();
+    console.log(`Quantity of product ${productId} updated to ${quantity} for identifier ${identifier}`);
   } catch (error) {
     console.error(
       `Error updating quantity for product ${productId} in cart for identifier ${identifier}:`,
-      error,
+      error
     );
     throw error;
   }
@@ -262,23 +296,18 @@ export async function updateCartItemQuantity(
  * @param identifier The cart/session identifier.
  * @param promoCode The promotion code to apply.
  */
-export async function applyPromoCodeToCart(
-  identifier: string,
-  promoCode: string,
-): Promise<void> {
-  const promoKey = `${getUserCartKey(identifier)}:promo`;
+export async function applyPromoCodeToCart(identifier: string, promoCode: string): Promise<void> {
+  const promoKey = _getCartPromoKey(identifier);
+  const pipeline = redisClient.pipeline();
+
+  pipeline.set(promoKey, promoCode);
+  await _refreshCartTTL(identifier, pipeline); // Refresh TTL for cart
 
   try {
-    await redisClient.set(promoKey, promoCode);
-    console.log(
-      `Promo code '${promoCode}' applied to cart for identifier ${identifier}`,
-    );
-    await setCartTTL(identifier); // Reset TTL whenever the cart is modified
+    await pipeline.exec();
+    console.log(`Promo code '${promoCode}' applied to cart for identifier ${identifier}`);
   } catch (error) {
-    console.error(
-      `Error applying promo code for identifier ${identifier}:`,
-      error,
-    );
+    console.error(`Error applying promo code for identifier ${identifier}:`, error);
     throw error;
   }
 }
@@ -288,36 +317,45 @@ export async function applyPromoCodeToCart(
  * @param identifier The cart/session identifier.
  * @returns The promo code or null.
  */
-export async function getAppliedPromoCode(
-  identifier: string,
-): Promise<string | null> {
-  const promoKey = `${getUserCartKey(identifier)}:promo`;
-
+export async function getAppliedPromoCode(identifier: string): Promise<string | null> {
+  const promoKey = _getCartPromoKey(identifier);
   try {
     return await redisClient.get(promoKey);
   } catch (error) {
-    console.error(
-      `Error retrieving promo code for identifier ${identifier}:`,
-      error,
-    );
+    console.error(`Error retrieving promo code for identifier ${identifier}:`, error);
     throw error;
   }
 }
 
 /**
- * Updates an existing product item in the user's cart in Redis.
- * This function overwrites the entire CartItem object associated with the productId.
+ * Updates an existing product item's details in the user's cart in Redis.
+ * This function overwrites the entire CartItem object's details associated with the productId.
+ * Quantity is handled separately.
  * @param identifier The unique identifier for the cart (session ID or authenticated user ID).
- * @param item The complete CartItem object to update (its productId is used as the key).
+ * @param item The complete CartItem object with updated details (its productId is used as the key).
  * @returns A promise that resolves when the operation is complete.
  */
-export async function updateCartItem(
-  identifier: string,
-  item: CartItem,
-): Promise<void> {
-  const cartKey = getUserCartKey(identifier);
-  const itemKey = item.productId;
-  await redisClient.hset(cartKey, itemKey, JSON.stringify(item));
+export async function updateCartItem(identifier: string, item: CartItem): Promise<void> {
+  const detailsKey = _getCartDetailsKey(identifier);
+  const productId = item.productId;
+
+  // Extract only necessary details for the 'details' hash
+  const productDetails = {
+    productId: item.productId,
+    name: item.name,
+    price: item.price,
+    // ... other non-quantity specific details here if any
+  };
+
+  const pipeline = redisClient.pipeline();
+  pipeline.hset(detailsKey, productId, JSON.stringify(productDetails));
+  await _refreshCartTTL(identifier, pipeline); // Refresh TTL for cart
+  try {
+    await pipeline.exec();
+  } catch (error) {
+    console.error(`Error updating cart item details for product ${productId} in cart for identifier ${identifier}:`, error);
+    throw error;
+  }
 }
 
 /**
@@ -333,124 +371,98 @@ export async function updateCartItem(
  * @returns A promise that resolves to an array of validated and sanitized `CartItem` objects.
  * An empty array is returned if the cart is empty or all items are invalid.
  */
-export async function validateAndSanitizeCart(
-  identifier: string,
-): Promise<CartItem[]> {
+export async function validateAndSanitizeCart(identifier: string): Promise<CartItem[]> {
   const cartItems = await getCart(identifier);
-  console.log("1. Cart Items Retrieved from Redis:", JSON.stringify(cartItems));
+  console.log('1. Cart Items Retrieved from Redis:', JSON.stringify(cartItems));
 
   if (!cartItems.length) {
-    console.log("2. Cart is empty after retrieval.");
+    console.log('2. Cart is empty after retrieval.');
     return [];
   }
 
-  const productIds = cartItems.map((item) => parseInt(item.productId, 10)); // Added radix 10 for safety
-  console.log(
-    "3. Product IDs parsed from cart items (for DB query):",
-    productIds,
-  );
+  const productIds = cartItems.map(item => parseInt(item.productId, 10));
+  console.log('3. Product IDs parsed from cart items (for DB query):', productIds);
 
-  const products: inventory_product[] = await prisma.inventory_product.findMany(
-    {
-      where: {
-        id: { in: productIds },
-        is_active: true,
-      },
+  const products: inventory_product[] = await prisma.inventory_product.findMany({
+    where: {
+      id: { in: productIds },
+      is_active: true,
     },
-  );
+  });
 
-  console.log(
-    "4. Products fetched from DB:",
-    products.map((p) => ({
-      id: p.id,
-      name: p.name,
-      is_active: p.is_active,
-      price: p.price,
-    })),
-  );
+  console.log('4. Products fetched from DB:', products.map(p => ({
+    id: p.id,
+    name: p.name,
+    is_active: p.is_active,
+    price: p.price,
+  })));
 
   const productMap = new Map<string, inventory_product>(
-    products.map((product) => [product.id.toString(), product]),
+    products.map(product => [product.id.toString(), product])
   );
-  console.log(
-    "5. Product Map Keys (from DB products):",
-    Array.from(productMap.keys()),
-  );
+  console.log('5. Product Map Keys (from DB products):', Array.from(productMap.keys()));
 
   const cleanedCart: CartItem[] = [];
-  const itemsToUpdateOrDelete: Promise<any>[] = [];
+  const pipeline = redisClient.multi(); // Initialize a Redis pipeline for batching operations
 
   for (const item of cartItems) {
-    console.log(
-      `6. Processing cart item with productId: "${item.productId}" (type: ${typeof item.productId})`,
-    );
-    const product: inventory_product | undefined = productMap.get(
-      item.productId,
-    );
+    console.log(`6. Processing cart item with productId: "${item.productId}" (type: ${typeof item.productId})`);
+    const product: inventory_product | undefined = productMap.get(item.productId);
 
     if (!product) {
-      console.warn(
-        `7. Product "${item.productId}" NOT FOUND or INACTIVE in DB. Removing from cart.`,
-      );
-      itemsToUpdateOrDelete.push(redisClient.hdel(_getCartQtyKey(identifier), item.productId));
-      itemsToUpdateOrDelete.push(redisClient.hdel(_getCartDetailsKey(identifier), item.productId));
-
-      // await removeProductFromCart(identifier, item.productId);
+      console.warn(`7. Product "${item.productId}" NOT FOUND or INACTIVE in DB. Removing from cart.`);
+      // Add deletion commands to the pipeline
+      pipeline.hdel(_getCartQtyKey(identifier), item.productId);
+      pipeline.hdel(_getCartDetailsKey(identifier), item.productId);
       continue; // Skip to next item
     } else {
       console.log(`7. Product "${item.productId}" FOUND in DB.`);
     }
 
     let updated = false;
-
-    // Ensure product.price is converted to a Number for accurate comparison with item.price (which is number)
-    // Remember product.price from Prisma is a Decimal type, so convert to number.
     const dbPrice = Number(product.price);
+
+    // Only update details if they've actually changed
     if (item.name !== product.name || item.price !== dbPrice) {
-      console.log(
-        `8. Item "${item.productId}" needs update: Name changed from "${item.name}" to "${product.name}" or Price changed from ${item.price} to ${dbPrice}`,
-      );
+      console.log(`8. Item "${item.productId}" needs update: Name changed from "${item.name}" to "${product.name}" or Price changed from ${item.price} to ${dbPrice}`);
       item.name = product.name;
       item.price = dbPrice;
       updated = true;
     }
 
     if (updated) {
-      console.log(
-        `9. Updating item "${item.productId}" in Redis due to data mismatch.`,
-      );
-      itemsToUpdateOrDelete.push(redisClient.hset(_getCartDetailsKey(identifier), item.productId, JSON.stringify({
-        productId: item.productId,
-        name: item.name,
-        price: item.price,
-      })));
-      // await updateCartItem(identifier, item);
+       console.log(`9. Updating item "${item.productId}" in Redis due to data mismatch.`);
+       // Add update command to the pipeline
+       pipeline.hset(_getCartDetailsKey(identifier), item.productId, JSON.stringify({
+           productId: item.productId,
+           name: item.name,
+           price: item.price,
+           // ... other details if any
+       }));
     }
 
     cleanedCart.push({
       ...item,
       valid: true,
-      error: "",
+      error: '',
     });
   }
 
-  if (itemsToUpdateOrDelete.length > 0) {
-    console.log(
-      `10. Performing ${itemsToUpdateOrDelete.length} Redis operations to update/delete cart items... for identifier ${identifier}`,
-    );
-    await Promise.all(itemsToUpdateOrDelete);
-    await setCartTTL(identifier); // Reset TTL after modifications
-  } 
-
-  if(await redisClient.hlen(_getCartQtyKey(identifier)) === 0) {
- 
-    await redisClient.del(_getCartPromoKey(identifier)); // Remove promo code if cart is now empty
-    console.log(`Cart ${identifier} is now empty after validation. Promo code removed.`);
+  // Execute all accumulated pipeline commands for deletions and updates
+  if (pipeline.length > 0) { // Check if there are any commands to execute
+      console.log(`10. Executing Redis pipeline for cart validation updates/deletions for identifier: ${identifier}`);
+      // Add TTL commands to the same pipeline to ensure they are part of the atomic transaction
+      await _refreshCartTTL(identifier, pipeline);
+      await pipeline.exec();
   }
 
-  console.log(
-    "10. Cleaned Cart before returning:",
-    JSON.stringify(cleanedCart),
-  );
+  // Final check to see if the cart became empty and delete promo code if so
+  // This check relies on the result of the pipeline, so it must be done afterwards.
+  if (await redisClient.hlen(_getCartQtyKey(identifier)) === 0) {
+      await redisClient.del(_getCartPromoKey(identifier));
+      console.log(`Cart ${identifier} is now empty after validation. Promo code deleted.`);
+  }
+
+  console.log('11. Cleaned Cart before returning:', JSON.stringify(cleanedCart));
   return cleanedCart;
 }
