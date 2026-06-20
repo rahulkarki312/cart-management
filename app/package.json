@@ -5,7 +5,7 @@
   "scripts": {
     "test": "echo \"Error: no test specified\" && exit 1",
     "swagger": "ts-node src/swagger.ts",
-    "dev": "npm run swagger && prisma generate && ts-node-dev --files src/index.ts"
+    "dev": "npm run swagger && prisma generate && ts-node-dev --poll --files src/index.ts"
   },
   "keywords": [],
   "author": "",
